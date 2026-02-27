@@ -143,5 +143,80 @@ class TestGetDownloadLinks(unittest.TestCase):
         self.assertEqual(downloader._guess_source("https://example.com/file"), "网络资源")
 
 
+class TestGenerateSiteLinks(unittest.TestCase):
+    """Tests for downloader._generate_site_links()"""
+
+    def test_movie_includes_bt_sites(self):
+        links = downloader._generate_site_links("肖申克的救赎", "movie")
+        sources = [l["source"] for l in links]
+        self.assertIn("磁力搜索", sources)
+        self.assertIn("1337x", sources)
+        self.assertIn("RARBG", sources)
+
+    def test_movie_includes_resource_sites(self):
+        links = downloader._generate_site_links("肖申克的救赎", "movie")
+        sources = [l["source"] for l in links]
+        self.assertIn("BD影视", sources)
+        self.assertIn("比特大雄", sources)
+        self.assertIn("迅雷影天堂", sources)
+
+    def test_movie_includes_streaming_sites(self):
+        links = downloader._generate_site_links("肖申克的救赎", "movie")
+        sources = [l["source"] for l in links]
+        self.assertIn("爱奇艺", sources)
+        self.assertIn("哔哩哔哩", sources)
+        self.assertIn("腾讯视频", sources)
+
+    def test_movie_includes_cloud_sites(self):
+        links = downloader._generate_site_links("肖申克的救赎", "movie")
+        sources = [l["source"] for l in links]
+        self.assertIn("阿里小站", sources)
+        self.assertIn("云盘资源网", sources)
+
+    def test_book_includes_book_sites(self):
+        links = downloader._generate_site_links("三体", "book")
+        sources = [l["source"] for l in links]
+        self.assertIn("Z-Library", sources)
+        self.assertIn("鸠摩搜书", sources)
+        # BT/streaming sites should NOT appear for books
+        self.assertNotIn("爱奇艺", sources)
+
+    def test_music_includes_music_sites(self):
+        links = downloader._generate_site_links("周杰伦", "music")
+        sources = [l["source"] for l in links]
+        self.assertIn("网易云音乐", sources)
+        self.assertIn("QQ音乐", sources)
+
+    def test_title_encoded_in_urls(self):
+        links = downloader._generate_site_links("三体", "movie")
+        for link in links:
+            self.assertIn("source", link)
+            self.assertIn("name", link)
+            self.assertIn("url", link)
+            self.assertIn("magnet", link)
+            self.assertEqual(link["magnet"], "")
+            # URL must be a string
+            self.assertIsInstance(link["url"], str)
+            self.assertTrue(link["url"].startswith("http"))
+
+    def test_title_present_in_url_or_name(self):
+        links = downloader._generate_site_links("三体", "movie")
+        for link in links:
+            combined = link["name"] + link["url"]
+            self.assertTrue(
+                "三体" in combined or "%E4%B8%89%E4%BD%93" in combined,
+                f"Title not found in link: {link}"
+            )
+
+    def test_get_download_links_includes_site_links(self):
+        """get_download_links aggregates site links even when page fetch fails."""
+        with patch.object(downloader, "_fetch_page", return_value=None):
+            links = downloader.get_download_links("肖申克的救赎", None, "movie")
+        sources = [l["source"] for l in links]
+        self.assertIn("磁力搜索", sources)
+        self.assertIn("BD影视", sources)
+        self.assertIn("爱奇艺", sources)
+
+
 if __name__ == "__main__":
     unittest.main()
