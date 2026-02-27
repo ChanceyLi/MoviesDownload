@@ -8,8 +8,11 @@ Entry point: run this file directly or build with PyInstaller.
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import messagebox, ttk
+from tkinter import messagebox, ttk, scrolledtext
 import webbrowser
+import json
+import os
+from datetime import datetime
 
 import searcher
 import downloader
@@ -41,6 +44,9 @@ class App(tk.Tk):
         self._selected = None       # currently selected result dict
         self._search_thread = None
         self._links_thread = None
+        self._links_cache = {}      # cache: item_id -> links list
+        self._history_file = "search_history.json"
+        self._history = self._load_history()
 
         self._build_ui()
 
@@ -59,6 +65,14 @@ class App(tk.Tk):
             bar, text="🎬 MoviesDownload", bg=SURFACE, fg=ACCENT_LIGHT,
             font=("Segoe UI", 14, "bold"),
         ).pack(side="left", padx=(16, 24))
+
+        # History button
+        tk.Button(
+            bar, text="📜 历史", command=self._show_history,
+            bg=SURFACE, fg=TEXT, activebackground=ACCENT,
+            font=("Segoe UI", 9), relief="flat",
+            padx=12, pady=2, cursor="hand2",
+        ).pack(side="left", padx=(0, 8))
 
         # Category radio buttons
         self._cat_var = tk.StringVar(value="movie")
@@ -183,6 +197,10 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "请输入搜索关键字")
             return
 
+        # Save to history
+        category = self._cat_var.get()
+        self._save_to_history(keyword, category)
+
         self._search_btn.config(state="disabled")
         self._listbox.delete(0, "end")
         self._clear_detail()
@@ -190,8 +208,6 @@ class App(tk.Tk):
         self._results = []
         self._selected = None
         self._set_status(f'正在搜索 "{keyword}"…')
-
-        category = self._cat_var.get()
 
         def run():
             results = searcher.search_douban(keyword, category)
@@ -223,6 +239,16 @@ class App(tk.Tk):
         self._selected = item
 
         self._show_detail(item)
+        
+        # Check cache first
+        cache_key = f"{item.get('id')}_{item.get('category', 'movie')}"
+        if cache_key in self._links_cache:
+            # Use cached links
+            links = self._links_cache[cache_key]
+            self._show_links(links, item)
+            self._set_status(f"已显示 {len(links)} 个缓存的下载链接")
+            return
+        
         self._clear_links()
         self._set_status(f'正在获取 "{item["title"]}" 的下载链接…')
 
@@ -230,6 +256,8 @@ class App(tk.Tk):
             links = downloader.get_download_links(
                 item["title"], item.get("id"), item.get("category", "movie")
             )
+            # Cache the links
+            self._links_cache[cache_key] = links
             self.after(0, lambda: self._on_links_done(links, item))
 
         self._links_thread = threading.Thread(target=run, daemon=True)
@@ -381,6 +409,133 @@ class App(tk.Tk):
 
     def _set_status(self, msg):
         self._status_var.set(msg)
+
+    # ─── history management ───────────────────────────────────────────────────
+
+    def _load_history(self):
+        """Load search history from JSON file."""
+        if not os.path.exists(self._history_file):
+            return []
+        try:
+            with open(self._history_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def _save_to_history(self, keyword, category):
+        """Save a search to history."""
+        entry = {
+            'keyword': keyword,
+            'category': category,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        # Remove duplicates (same keyword and category)
+        self._history = [h for h in self._history 
+                        if not (h['keyword'] == keyword and h['category'] == category)]
+        # Add to front
+        self._history.insert(0, entry)
+        # Keep only last 50 entries
+        self._history = self._history[:50]
+        # Save to file
+        try:
+            with open(self._history_file, 'w', encoding='utf-8') as f:
+                json.dump(self._history, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _show_history(self):
+        """Show history window."""
+        if not self._history:
+            messagebox.showinfo("历史记录", "暂无搜索历史")
+            return
+
+        history_win = tk.Toplevel(self)
+        history_win.title("搜索历史")
+        history_win.geometry("600x400")
+        history_win.configure(bg=BG)
+        history_win.transient(self)
+        history_win.grab_set()
+
+        tk.Label(
+            history_win, text="搜索历史记录", bg=BG, fg=TEXT,
+            font=("Segoe UI", 14, "bold"), pady=10
+        ).pack()
+
+        # Create frame for list
+        list_frame = tk.Frame(history_win, bg=SURFACE)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+        scrollbar.pack(side="right", fill="y")
+
+        history_list = tk.Listbox(
+            list_frame, bg=SURFACE, fg=TEXT,
+            selectbackground=ACCENT, selectforeground="white",
+            activestyle="none", font=("Segoe UI", 10),
+            relief="flat", yscrollcommand=scrollbar.set,
+            cursor="hand2"
+        )
+        history_list.pack(fill="both", expand=True)
+        scrollbar.config(command=history_list.yview)
+
+        # Populate history
+        cat_labels = {"movie": "电影", "book": "图书", "music": "音乐"}
+        for entry in self._history:
+            cat_label = cat_labels.get(entry['category'], entry['category'])
+            display = f"{entry['keyword']} [{cat_label}] - {entry['timestamp']}"
+            history_list.insert("end", display)
+
+        # Buttons frame
+        btn_frame = tk.Frame(history_win, bg=BG)
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        def on_search_again():
+            sel = history_list.curselection()
+            if not sel:
+                messagebox.showwarning("提示", "请选择一条历史记录")
+                return
+            idx = sel[0]
+            entry = self._history[idx]
+            history_win.destroy()
+            # Set search parameters and search
+            self._search_var.set(entry['keyword'])
+            self._cat_var.set(entry['category'])
+            self._do_search()
+
+        def on_clear_history():
+            if messagebox.askyesno("确认", "确定要清空所有历史记录吗？"):
+                self._history = []
+                try:
+                    if os.path.exists(self._history_file):
+                        os.remove(self._history_file)
+                except Exception:
+                    pass
+                history_win.destroy()
+                messagebox.showinfo("提示", "历史记录已清空")
+
+        tk.Button(
+            btn_frame, text="再次搜索", command=on_search_again,
+            bg=ACCENT, fg="white", activebackground=ACCENT_LIGHT,
+            font=("Segoe UI", 10, "bold"), relief="flat",
+            padx=18, pady=6, cursor="hand2"
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            btn_frame, text="清空历史", command=on_clear_history,
+            bg=DANGER, fg="white", activebackground="#dc2626",
+            font=("Segoe UI", 10, "bold"), relief="flat",
+            padx=18, pady=6, cursor="hand2"
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            btn_frame, text="关闭", command=history_win.destroy,
+            bg=SURFACE, fg=TEXT, activebackground=TEXT_DIM,
+            font=("Segoe UI", 10), relief="flat",
+            padx=18, pady=6, cursor="hand2"
+        ).pack(side="right", padx=5)
+
+        # Double-click to search
+        history_list.bind("<Double-Button-1>", lambda _e: on_search_again())
 
 
 if __name__ == "__main__":
