@@ -1,13 +1,22 @@
 """
-Tests for searcher and downloader modules.
+Tests for searcher, downloader, download_manager modules, and
+settings / download-history helpers extracted from main.
 Run with:  python -m pytest tests.py -v
 """
 
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
 import searcher
 import downloader
+import download_manager as dm
+import app_config
 
 
 # ─── searcher tests ───────────────────────────────────────────────────────────
@@ -216,6 +225,270 @@ class TestGenerateSiteLinks(unittest.TestCase):
         self.assertIn("磁力搜索", sources)
         self.assertIn("BD影视", sources)
         self.assertIn("爱奇艺", sources)
+
+
+# ─── download_manager tests ───────────────────────────────────────────────────
+
+class TestDownloadTask(unittest.TestCase):
+    """Tests for dm.DownloadTask lifecycle."""
+
+    def _make_task(self):
+        return dm.DownloadTask("https://example.com/file.zip", "file.zip", "/tmp")
+
+    def test_initial_status(self):
+        t = self._make_task()
+        self.assertEqual(t.status, dm.DownloadStatus.PENDING)
+
+    def test_cancel(self):
+        t = self._make_task()
+        t.cancel()
+        self.assertEqual(t.status, dm.DownloadStatus.CANCELLED)
+        self.assertTrue(t.should_stop())
+
+    def test_pause_resume(self):
+        t = self._make_task()
+        t.status = dm.DownloadStatus.DOWNLOADING
+        t.pause()
+        self.assertEqual(t.status, dm.DownloadStatus.PAUSED)
+        self.assertTrue(t.should_pause())
+
+        t.resume()
+        self.assertEqual(t.status, dm.DownloadStatus.PENDING)
+        self.assertFalse(t.should_pause())
+
+    def test_unique_ids(self):
+        # Tasks with *different* URLs must get different IDs
+        t1 = dm.DownloadTask("https://example.com/a.zip", "a.zip", "/tmp")
+        t2 = dm.DownloadTask("https://example.com/b.zip", "b.zip", "/tmp")
+        self.assertNotEqual(t1.id, t2.id)
+
+
+class TestDownloadManager(unittest.TestCase):
+    """Tests for dm.DownloadManager."""
+
+    def setUp(self):
+        self.manager = dm.DownloadManager(max_concurrent=2)
+
+    def tearDown(self):
+        self.manager.shutdown()
+
+    def test_add_task_returns_id(self):
+        task_id = self.manager.add_task(
+            "https://example.com/f.zip", "f.zip", "/tmp"
+        )
+        self.assertIsNotNone(task_id)
+
+    def test_get_task(self):
+        task_id = self.manager.add_task(
+            "https://example.com/f.zip", "f.zip", "/tmp"
+        )
+        task = self.manager.get_task(task_id)
+        self.assertIsNotNone(task)
+        self.assertEqual(task.filename, "f.zip")
+
+    def test_get_all_tasks(self):
+        self.manager.add_task("https://example.com/a.zip", "a.zip", "/tmp")
+        self.manager.add_task("https://example.com/b.zip", "b.zip", "/tmp")
+        tasks = self.manager.get_all_tasks()
+        self.assertEqual(len(tasks), 2)
+
+    def test_cancel_task(self):
+        task_id = self.manager.add_task(
+            "https://example.com/f.zip", "f.zip", "/tmp"
+        )
+        self.manager.cancel_task(task_id)
+        task = self.manager.get_task(task_id)
+        self.assertEqual(task.status, dm.DownloadStatus.CANCELLED)
+
+    def test_clear_completed(self):
+        task_id = self.manager.add_task(
+            "https://example.com/f.zip", "f.zip", "/tmp"
+        )
+        # Manually mark as completed
+        task = self.manager.get_task(task_id)
+        task.status = dm.DownloadStatus.COMPLETED
+        self.manager.clear_completed()
+        self.assertIsNone(self.manager.get_task(task_id))
+
+    def test_pause_task_only_when_downloading(self):
+        task_id = self.manager.add_task(
+            "https://example.com/f.zip", "f.zip", "/tmp"
+        )
+        # Task is PENDING – pausing should be a no-op
+        self.manager.pause_task(task_id)
+        task = self.manager.get_task(task_id)
+        self.assertNotEqual(task.status, dm.DownloadStatus.PAUSED)
+
+    def test_actual_download(self):
+        """Integration: download with a mocked HTTP response."""
+        import io as _io
+
+        fake_data = b"x" * 2048
+        fake_response = MagicMock()
+        fake_response.__enter__ = lambda s: s
+        fake_response.__exit__ = MagicMock(return_value=False)
+        fake_response.read = MagicMock(side_effect=[fake_data, b""])
+        fake_response.headers = {"Content-Length": str(len(fake_data))}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = dm.DownloadManager(max_concurrent=1)
+            done = threading.Event()
+            results = []
+
+            def cb(task):
+                results.append(task.status)
+                if task.status in (
+                    dm.DownloadStatus.COMPLETED,
+                    dm.DownloadStatus.FAILED,
+                    dm.DownloadStatus.CANCELLED,
+                ):
+                    done.set()
+
+            with patch("urllib.request.urlopen", return_value=fake_response):
+                task_id = manager.add_task(
+                    "https://example.com/test.bin",
+                    "test.bin",
+                    tmpdir,
+                    callback=cb,
+                )
+                done.wait(timeout=10)
+
+            task = manager.get_task(task_id)
+            # Should have reached a proper terminal state
+            self.assertIn(
+                task.status,
+                {dm.DownloadStatus.COMPLETED, dm.DownloadStatus.FAILED},
+            )
+            manager.shutdown()
+
+
+class TestFormatHelpers(unittest.TestCase):
+    """Tests for dm.format_size and dm.format_speed."""
+
+    def test_format_size_bytes(self):
+        self.assertEqual(dm.format_size(512), "512.0 B")
+
+    def test_format_size_kb(self):
+        self.assertEqual(dm.format_size(1024), "1.0 KB")
+
+    def test_format_size_mb(self):
+        self.assertEqual(dm.format_size(1024 * 1024), "1.0 MB")
+
+    def test_format_speed(self):
+        self.assertIn("/s", dm.format_speed(1024))
+
+
+# ─── settings helpers tests ───────────────────────────────────────────────────
+
+class TestSettingsHelpers(unittest.TestCase):
+    """Tests for app_config.load_settings / save_settings."""
+
+    def test_load_defaults_when_no_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                settings = app_config.load_settings()
+                for key in app_config.DEFAULT_SETTINGS:
+                    self.assertIn(key, settings)
+                self.assertEqual(settings["theme"], "深色紫")
+            finally:
+                os.chdir(original_cwd)
+
+    def test_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                settings = app_config.load_settings()
+                settings["theme"] = "深色蓝"
+                settings["download_path"] = "/custom/path"
+                app_config.save_settings(settings)
+                loaded = app_config.load_settings()
+                self.assertEqual(loaded["theme"], "深色蓝")
+                self.assertEqual(loaded["download_path"], "/custom/path")
+            finally:
+                os.chdir(original_cwd)
+
+
+# ─── fuzzy search helper tests ────────────────────────────────────────────────
+
+class TestFuzzyMatch(unittest.TestCase):
+    """Test the fuzzy-match logic independently (no GUI needed)."""
+
+    def _make_history(self, keywords):
+        return [{"keyword": kw, "category": "movie", "timestamp": ""} for kw in keywords]
+
+    def _get_fuzzy_matches(self, history, text, limit=8):
+        """Mirror of App._get_fuzzy_matches for unit testing."""
+        text_lower = text.lower()
+        seen = set()
+        matches = []
+        for entry in history:
+            kw = entry["keyword"]
+            if text_lower in kw.lower() and kw not in seen:
+                matches.append(kw)
+                seen.add(kw)
+            if len(matches) >= limit:
+                break
+        return matches
+
+    def test_exact_prefix(self):
+        history = self._make_history(["肖申克的救赎", "速度与激情", "速度与激情7"])
+        matches = self._get_fuzzy_matches(history, "速度")
+        self.assertIn("速度与激情", matches)
+        self.assertIn("速度与激情7", matches)
+        self.assertNotIn("肖申克的救赎", matches)
+
+    def test_substring_match(self):
+        history = self._make_history(["The Dark Knight", "Dark Souls", "Batman"])
+        matches = self._get_fuzzy_matches(history, "dark")
+        self.assertIn("The Dark Knight", matches)
+        self.assertIn("Dark Souls", matches)
+        self.assertNotIn("Batman", matches)
+
+    def test_case_insensitive(self):
+        history = self._make_history(["Python Programming"])
+        self.assertEqual(
+            self._get_fuzzy_matches(history, "python"),
+            ["Python Programming"],
+        )
+
+    def test_no_duplicates(self):
+        history = self._make_history(["三体", "三体", "三体II"])
+        matches = self._get_fuzzy_matches(history, "三体")
+        self.assertEqual(matches.count("三体"), 1)
+
+    def test_limit_respected(self):
+        history = self._make_history([f"电影{i}" for i in range(20)])
+        matches = self._get_fuzzy_matches(history, "电影", limit=5)
+        self.assertEqual(len(matches), 5)
+
+    def test_empty_history(self):
+        self.assertEqual(self._get_fuzzy_matches([], "anything"), [])
+
+    def test_no_match(self):
+        history = self._make_history(["三体", "流浪地球"])
+        self.assertEqual(self._get_fuzzy_matches(history, "batman"), [])
+
+
+# ─── theme definitions test ───────────────────────────────────────────────────
+
+class TestThemes(unittest.TestCase):
+    """Verify THEMES dict structure."""
+
+    def test_all_themes_have_required_keys(self):
+        required = {"BG", "SURFACE", "ACCENT", "ACCENT_LIGHT",
+                    "TEXT", "TEXT_DIM", "SUCCESS", "DANGER", "ENTRY_BG"}
+        for name, theme in app_config.THEMES.items():
+            for key in required:
+                self.assertIn(key, theme, f"Theme '{name}' missing key '{key}'")
+
+    def test_theme_count(self):
+        self.assertGreaterEqual(len(app_config.THEMES), 4)
+
+    def test_default_theme_present(self):
+        self.assertIn(app_config.DEFAULT_SETTINGS["theme"], app_config.THEMES)
 
 
 if __name__ == "__main__":
